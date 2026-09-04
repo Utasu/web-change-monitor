@@ -1,5 +1,7 @@
 # Web Change Monitor
 
+[![tests](https://github.com/Utasu/web-change-monitor/actions/workflows/tests.yml/badge.svg)](https://github.com/Utasu/web-change-monitor/actions/workflows/tests.yml)
+
 A cautious Python monitor for authorized public HTTPS pages. It stores normalized text snapshots in SQLite and reports only meaningful changes.
 
 ## Safety choices
