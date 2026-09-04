@@ -1,0 +1,12 @@
+[Unit]
+Description=Check authorized HTTPS pages every 30 minutes
+
+[Timer]
+OnActiveSec=10min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=web-change-monitor.service
+
+[Install]
+WantedBy=timers.target

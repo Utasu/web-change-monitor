@@ -1,0 +1,27 @@
+[Unit]
+Description=Authorized HTTPS page change monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=web-change-monitor
+Group=web-change-monitor
+ExecStart=/usr/bin/python3 /opt/web-change-monitor/site_monitor.py --config /etc/web-change-monitor/config.json --db /var/lib/web-change-monitor/monitor.sqlite3
+StateDirectory=web-change-monitor
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=128M

@@ -1,0 +1,8 @@
+[project]
+name = "web-change-monitor"
+version = "1.0.0"
+description = "Safely monitor authorized HTTPS pages for meaningful changes"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100

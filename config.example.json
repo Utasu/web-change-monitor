@@ -1,0 +1,11 @@
+{
+  "targets": [
+    {
+      "name": "Example status page",
+      "url": "https://example.com/",
+      "ignore_patterns": [
+        "^Last updated:"
+      ]
+    }
+  ]
+}
