@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import difflib
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -25,6 +26,7 @@ from typing import Any, Callable
 
 UTC = dt.timezone.utc
 MAX_RESPONSE_BYTES = 1_000_000
+MAX_REDIRECTS = 5
 
 
 def now_iso() -> str:
@@ -84,7 +86,12 @@ class VisibleTextParser(HTMLParser):
 def normalize_content(content: bytes, content_type: str, ignore_patterns: list[str]) -> str:
     charset_match = re.search(r"charset=([\w-]+)", content_type, re.I)
     charset = charset_match.group(1) if charset_match else "utf-8"
-    text = content.decode(charset, errors="replace")
+    try:
+        text = content.decode(charset, errors="replace")
+    except LookupError:
+        # A page may advertise an encoding Python does not know; that is the page's
+        # problem, not a reason to abort every remaining target in this run.
+        text = content.decode("utf-8", errors="replace")
     if "html" in content_type.lower() or "<html" in text[:1000].lower():
         parser = VisibleTextParser()
         parser.feed(text)
@@ -118,11 +125,44 @@ class Target:
         return cls(name=name, url=safe_https_url(str(value.get("url") or "")), ignore_patterns=patterns)
 
 
-class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
-        checked = safe_https_url(newurl)
-        ensure_public_host(urllib.parse.urlparse(checked).hostname or "")
-        return super().redirect_request(req, fp, code, msg, headers, checked)
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that dials one pre-validated IP address.
+
+    Validating a hostname and then letting the socket layer resolve it again leaves a
+    DNS-rebinding window: the second lookup can return a private address that the
+    check never saw. Pinning the address that passed validation closes that window,
+    while the original hostname is still used for SNI, certificate validation and the
+    Host header.
+    """
+
+    def __init__(self, host: str, pinned_ip: str, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self.pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self.pinned_ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host.split(":")[0])
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, pinned_ip: str) -> None:
+        super().__init__()
+        self.pinned_ip = pinned_ip
+
+    def https_open(self, request: Any) -> Any:
+        def build(host: str, **kwargs: Any) -> PinnedHTTPSConnection:
+            kwargs.pop("context", None)
+            kwargs.pop("check_hostname", None)
+            return PinnedHTTPSConnection(host, self.pinned_ip, **kwargs)
+
+        return self.do_open(build, request)
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Surface redirects instead of following them, so each hop is re-validated."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -135,8 +175,6 @@ class FetchResult:
 
 
 def fetch_target(target: Target, etag: str = "", last_modified: str = "") -> FetchResult:
-    hostname = urllib.parse.urlparse(target.url).hostname or ""
-    ensure_public_host(hostname)
     headers = {
         "Accept": "text/html,text/plain,application/json;q=0.8",
         "User-Agent": "authorized-web-change-monitor/1.0 (+contact-site-owner)",
@@ -145,25 +183,37 @@ def fetch_target(target: Target, etag: str = "", last_modified: str = "") -> Fet
         headers["If-None-Match"] = etag
     if last_modified:
         headers["If-Modified-Since"] = last_modified
-    request = urllib.request.Request(target.url, headers=headers)
-    opener = urllib.request.build_opener(SafeRedirectHandler())
-    try:
-        response = opener.open(request, timeout=20)
-    except urllib.error.HTTPError as error:
-        if error.code == 304:
-            return FetchResult(304, b"", "", etag, last_modified)
-        raise
-    with response:
-        content = response.read(MAX_RESPONSE_BYTES + 1)
-        if len(content) > MAX_RESPONSE_BYTES:
-            raise ValueError("response exceeds the 1 MB safety limit")
-        return FetchResult(
-            status=response.status,
-            content=content,
-            content_type=response.headers.get("Content-Type", "application/octet-stream"),
-            etag=response.headers.get("ETag", ""),
-            last_modified=response.headers.get("Last-Modified", ""),
-        )
+
+    url = target.url
+    for _ in range(MAX_REDIRECTS + 1):
+        hostname = urllib.parse.urlparse(url).hostname or ""
+        # Every hop is validated on its own, then dialled on the address that passed.
+        pinned = ensure_public_host(hostname)[0]
+        opener = urllib.request.build_opener(NoRedirectHandler(), PinnedHTTPSHandler(pinned))
+        try:
+            response = opener.open(urllib.request.Request(url, headers=headers), timeout=20)
+        except urllib.error.HTTPError as error:
+            if error.code == 304:
+                return FetchResult(304, b"", "", etag, last_modified)
+            if error.code in (301, 302, 303, 307, 308):
+                location = error.headers.get("Location", "")
+                if not location:
+                    raise ValueError("redirect without a Location header")
+                url = safe_https_url(urllib.parse.urljoin(url, location))
+                continue
+            raise
+        with response:
+            content = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(content) > MAX_RESPONSE_BYTES:
+                raise ValueError("response exceeds the 1 MB safety limit")
+            return FetchResult(
+                status=response.status,
+                content=content,
+                content_type=response.headers.get("Content-Type", "application/octet-stream"),
+                etag=response.headers.get("ETag", ""),
+                last_modified=response.headers.get("Last-Modified", ""),
+            )
+    raise ValueError(f"too many redirects (limit {MAX_REDIRECTS})")
 
 
 class MonitorStore:
@@ -189,13 +239,20 @@ class MonitorStore:
             CREATE TABLE IF NOT EXISTS changes (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               url TEXT NOT NULL,
+              name TEXT NOT NULL DEFAULT '',
               old_hash TEXT NOT NULL,
               new_hash TEXT NOT NULL,
               diff_preview TEXT NOT NULL,
-              detected_at TEXT NOT NULL
+              detected_at TEXT NOT NULL,
+              notified_at TEXT
             );
             """
         )
+        # Databases created before delivery tracking existed still need the columns.
+        existing = {row["name"] for row in self.connection.execute("PRAGMA table_info(changes)")}
+        for column in ("name TEXT NOT NULL DEFAULT ''", "notified_at TEXT"):
+            if column.split()[0] not in existing:
+                self.connection.execute(f"ALTER TABLE changes ADD COLUMN {column}")
         self.connection.commit()
 
     def get(self, url: str) -> sqlite3.Row | None:
@@ -231,8 +288,9 @@ class MonitorStore:
             status = "changed"
             old_hash = current["content_hash"]
             self.connection.execute(
-                "INSERT INTO changes(url,old_hash,new_hash,diff_preview,detected_at) VALUES(?,?,?,?,?)",
-                (target.url, old_hash, new_hash, preview, stamp),
+                """INSERT INTO changes(url,name,old_hash,new_hash,diff_preview,detected_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (target.url, target.name, old_hash, new_hash, preview, stamp),
             )
         else:
             preview, status, old_hash = "", "first_seen", ""
@@ -256,6 +314,25 @@ class MonitorStore:
             "new_hash": new_hash,
             "diff_preview": preview,
         }
+
+    def pending_changes(self) -> list[sqlite3.Row]:
+        """Detected changes that still owe a notification.
+
+        A change is committed to the database before anything is sent, so the next run
+        sees an unchanged hash. Without this queue a failed send would lose the change
+        permanently, which is the one thing a monitor must never do.
+        """
+        return list(
+            self.connection.execute(
+                "SELECT * FROM changes WHERE notified_at IS NULL ORDER BY id"
+            )
+        )
+
+    def mark_change_notified(self, change_id: int) -> None:
+        self.connection.execute(
+            "UPDATE changes SET notified_at=? WHERE id=?", (now_iso(), change_id)
+        )
+        self.connection.commit()
 
     def record_error(self, target: Target, error: Exception) -> None:
         current = self.get(target.url)
@@ -308,6 +385,29 @@ def check_target(store: MonitorStore, target: Target) -> dict[str, Any]:
     return store.observe(target, normalized, fetched.etag, fetched.last_modified)
 
 
+def deliver_pending(store: MonitorStore, sender: Callable[[str], None] = telegram_send) -> dict[str, int]:
+    """Send every change that has not been reported yet.
+
+    A change is only marked as delivered once the send succeeded, so a Telegram
+    outage delays notifications instead of dropping them.
+    """
+    counts = {"notified": 0, "failed": 0}
+    for row in store.pending_changes():
+        message = (
+            f"🔎 Page changed: {row['name'] or row['url']}\n{row['url']}\n\n"
+            + (row["diff_preview"] or "Content hash changed")[:3000]
+        )
+        try:
+            sender(message)
+        except (OSError, ValueError, RuntimeError, urllib.error.URLError, json.JSONDecodeError) as error:
+            counts["failed"] += 1
+            print(f"warning: delivery failed, will retry next run: {error}", file=sys.stderr)
+            continue
+        store.mark_change_notified(row["id"])
+        counts["notified"] += 1
+    return counts
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("config.json"))
@@ -318,20 +418,16 @@ def main(argv: list[str] | None = None) -> int:
     results: list[dict[str, Any]] = []
     for target in load_targets(args.config):
         try:
-            result = check_target(store, target)
-            results.append(result)
-            if result["status"] == "changed" and args.send:
-                telegram_send(
-                    f"🔎 Page changed: {target.name}\n{target.url}\n\n"
-                    + (result.get("diff_preview") or "Content hash changed")[:3000]
-                )
+            results.append(check_target(store, target))
         except (OSError, ValueError, RuntimeError, urllib.error.URLError) as error:
             store.record_error(target, error)
             results.append(
                 {"name": target.name, "url": target.url, "status": "error", "error": type(error).__name__}
             )
-    print(json.dumps(results, ensure_ascii=False, indent=2))
-    return 1 if any(result["status"] == "error" for result in results) else 0
+    delivery = deliver_pending(store) if args.send else {"notified": 0, "failed": 0}
+    print(json.dumps({"results": results, "delivery": delivery}, ensure_ascii=False, indent=2))
+    failed = any(result["status"] == "error" for result in results) or delivery["failed"]
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
